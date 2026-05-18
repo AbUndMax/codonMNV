@@ -20,16 +20,49 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s |")
 
 
 def collect_samples_with_variant(line_split):
+    """
+    Takes a single VCF entry line and processes the genotype fields of each sample.
+
+    The following assumptions are made in order to correctly parse:
+    - the FORMAT is always the same and has 6 fields (GT:AD:AF:DP:GQ:PL)
+    - GT is only one integer or missing (i.e ".") formats like 1|1 ./. or similar are not handled! (later update)
+    - AD is either "." or a comma-separated list of integers (i.e. "0,1") with len = 2
+    - AF is either "." or a floating point number (i.e. "0.5")
+    - DP and GQ are either "." or integers (i.e. "100" or "0")
+    - PL is either "." or a comma-separated list of integers (i.e. "0,100") with len = 2
+
+    If the any of those assumptions are not met, the program will crash and terminate with ValueError.
+    Which is intentional in the current early stage version of the tool
+
+    Returns:
+        tuple of: (numpy array, SampleStats)
+            - the numpy array is parallel to the samples in the VCF header starting at column index 9
+            and has boolean values (True = variant present, False = no variant present)
+            - the SampleStats object contains all genotype field informations (GT, AD, AF, DP, GQ, PL).
+            Each stat is organized in a parallel numpy array. (see @SampleStats class)
+    """
 
     # generate list of "per sample" stats: [[GT, AD, AF, DP, GQ, PL], [GT, AD, AF, DP, GQ, PL], ...]
     per_sample_stats = SampleStats(line_split[9:])
-    per_sample_gt = np.array(per_sample_stats.id_to_stats_array["GT"][:]) > 0 # does also cover nan vals sind np.nan > 0 = False
+    per_sample_gt = np.array(per_sample_stats.id_to_stats_array["GT"][:]) > 0 # does also cover nan vals (np.nan > 0 = False)
 
     return per_sample_gt, per_sample_stats
 
 
 
 def start_end_of_gene(vcf_file):
+    """
+    Reads the header of a VCF file in order to find the genomic region of the gene.
+
+    This is only possible if the VCF file was processed with bcftools view
+    in order to truncate a full VCF only to the CDS region of a specific gene.
+    Thus resulting in a header entry starting with: ##bcftools_viewCommand=view -r <chromosome>:<start>-<end>
+    from which the CDS region can be extracted.
+
+    Returns:
+         The start and end CDS region of the gene in the gene-specific VCF file.
+    """
+
     with open(vcf_file, "r") as f:
         for line in f:
             if line.startswith("##bcftools_viewCommand=view -r"):
@@ -46,12 +79,20 @@ def start_end_of_gene(vcf_file):
 def parse_reference_fasta(fasta_file, start_of_gene, end_of_gene):
     """slice the respective gene region from the reference fasta file"""
     reference = SeqIO.read(fasta_file, "fasta")
+    # start -1 to account for 0-based indexing (VCF counts 1-based!)
     return str(reference.seq)[start_of_gene-1:end_of_gene]
 
 
 
 # possoble improvements: Dynamic type setting (via format_meta)
 class SampleStats:
+    """
+    This class is used to store the sample stats (GT, AD, AF, DP, GQ, PL) of all genotype fields in a VCF entry.
+
+    Each stat is organized in a parallel numpy array with its respective type.
+
+    MISSING_VALUE is set to -1 in order to maintain type consistency. (np.nan is always a float!)
+    """
 
     MISSING_VALUE = -1
 
@@ -88,6 +129,20 @@ class SampleStats:
         return [int(x) if x != "." else SampleStats.MISSING_VALUE for x in value.split(",")]
 
     def parse_sample_stats(self, sample_stats_list):
+        """
+        Awaits a list of genotype fields i.e. ["GT:AD:AF:DP:GQ:PL", "GT:AD:AF:DP:GQ:PL", ...]
+
+        handles the genotype field for each sample by splitting the genotype fields
+        and storing the individual components in their respective numpy arrays.
+
+        Arguments:
+            sample_stats_list (list[str]): List of genotype field strings to be parsed. Each
+                string is expected to follow the format "GT:AD:AF:DP:GQ:PL".
+
+        Raises:
+            ValueError: If the number of components in a genotype field string does not match
+                the expected FORMAT fields.
+        """
         GT, AD, AF, DP, GQ, PL = [], [], [], [], [], []
 
         for sample in sample_stats_list:
@@ -117,12 +172,30 @@ class SampleStats:
 
     @staticmethod
     def combine_sample_stats(*sample_stats):
+        """
+        Combines two or more SampleStats objects into a single SampleStats object.
+
+        The combined SampleStats object will contain the minimum of the stats for each stat type. (conservative)
+
+        GT  -> Minimum pro Sample
+        AD  -> elementweises Minimum pro Sample
+        AF  -> Minimum pro Sample
+        DP  -> Minimum pro Sample
+        GQ  -> Minimum pro Sample
+        PL  -> elementweises Maximum pro Sample
+
+        None values within sample_stats are ignored.
+
+        Returns a new SampleStats object with the combined stats.
+        """
+
         if len(sample_stats) == 1 and isinstance(sample_stats[0], (list, tuple)):
             sample_stats = sample_stats[0]
 
         if len(sample_stats) == 0:
             raise ValueError("No SampleStats objects provided")
 
+        # remove None values
         valid_sample_stats = [s for s in sample_stats if s is not None]
 
         for s in valid_sample_stats:
@@ -160,6 +233,10 @@ class SampleStats:
 
 
     def __str__(self):
+        """
+        Generates the genotype field string for the SampleStats object.
+        """
+
         arrays = [self.id_to_stats_array[id] for id in self.ids]
 
         full_line = []
@@ -183,17 +260,62 @@ class SampleStats:
 
 
 class Codon:
+    """
+    Represents a codon at a specific position on a reference sequence.
+
+    This class stores all variants observed within that codon and provides methods
+    to iterate over all possible codon-level variant combinations across samples.
+    These combinations are later used to identify candidate cMNVs.
+    """
 
     # initilaize
     def __init__(self, ref_seq, chromosome=None, format_string=None,
                  codon_index=0, pos=None, relative_pos=None, alt=None, per_sample_gt=None, per_sample_stats=None):
+        """
+        Represents a codon with informations, such as reference sequence, chromosome,
+        format string, and various codon-related attributes, with support for modeling multiple variants
+        at the same position within the codon.
+
+        Class fields:
+            ref_seq: str
+                The reference nucleotide sequence.
+            chromosome: str or None
+                The name of the chromosome. Default is None.
+            format_string: str or None
+                An optional format string for variant representation. Default is None.
+            codon_index: int
+                The index of the codon in the sequence. Default is 0.
+            codon_sample_stats_per_position: list[dict]
+                A list containing three dictionaries, each corresponding to one position in the codon.
+                Each dictionary models multiple variants at the same position in the codon, with keys
+                representing alternative variants and values as tuples containing per-sample genotype and
+                genotype fields per sample.
+            affected_positions: list or None
+                A list of three elements representing whether each position in the codon is affected by variants.
+            reference_codon_seq: list[str]
+                A list of nucleotides representing the reference codon sequence.
+            codon_seq: list[list[str]]
+                A list of lists where each sublist contains possible letters (e.g., nucleotides) for
+                each position in the codon, based on modeled variants.
+
+        Arguments:
+            ref_seq (str): Reference nucleotide sequence of the CDS or analyzed region.
+            chromosome (str | None): Chromosome or contig name. Default is None.
+            format_string (str | None): VCF FORMAT string used for the genotype fields. Default is None.
+            codon_index (int): Zero-based index of the codon within ref_seq. Default is 0.
+            pos (int | str | None): Genomic position of the variant. Default is None.
+            relative_pos (int | None): Zero-based variant position relative to the start of ref_seq. Default is None.
+            alt (str | None): Alternate nucleotide observed at this position. Default is None.
+            per_sample_gt (np.ndarray | None): Boolean array indicating which samples carry the variant. Default is None.
+            per_sample_stats (SampleStats | None): Parsed genotype field statistics for all samples. Default is None.
+        """
 
         self.ref_seq = ref_seq
         self.chromosome = chromosome
         self.format_string = format_string
         self.codon_index = codon_index
 
-        #use of dictionary to model multiple variants at the same position in the codon
+        # use of dictionary to model multiple variants at the same position in the codon
         # key = alt variant in this position
         #       value= (per_sample_gt, per_sample_stats)
         self.codon_sample_stats_per_position = [
@@ -208,11 +330,25 @@ class Codon:
         # possible letters per position: ie.: [[A, C], [T], [G, T]]
         self.codon_seq = [[letter] for letter in self.reference_codon_seq]
 
-        if pos and relative_pos and alt and per_sample_gt is not None and per_sample_stats is not None:
+        if all(x is not None for x in (pos, relative_pos, alt, per_sample_gt, per_sample_stats)):
             self.add_new_alt(pos, relative_pos, alt, per_sample_gt, per_sample_stats)
 
 
     def add_new_alt(self, pos, relative_pos, alt, per_sample_gt, per_sample_stats):
+        """
+        Adds a new alternate variant to the codon sequence at the specified position, saves
+        informations associated with the variant and records the genomic position.
+
+        Arguments:
+            pos (int): Genomic position of the alternate variant.
+            relative_pos (int): Position relative to the codon sequence.
+            alt (str): Alternate variant to be added.
+            per_sample_gt (Any): GT boolean array related to the variant, for each
+                sample.
+            per_sample_stats (Any): Genotype fields associated with the variant, for each
+                sample.
+        """
+
         pos_in_codon = relative_pos % 3
 
         # save the samples that have that variant in pos_in_cdn position
@@ -238,6 +374,7 @@ class Codon:
 
 
     def is_possible_mnv(self):
+        """Checks if the codon is a possible mnv. (i.e. more than one alt variant in one position)"""
         return sum(bool(pos_dict) for pos_dict in self.codon_sample_stats_per_position) >= 2
 
 
@@ -267,6 +404,17 @@ class Codon:
 
 
     def iter_base_combinations(self):
+        """
+        Generates all possible base combinations for a codon sequence
+        while including genotype field informations of the respective variant.
+
+        Yields:
+            tuple: A tuple containing:
+                - A list of three characters representing the current combination of bases for
+                  the codon sequence.
+                - boolean GT np array.
+                - Genotype Fields for each sample.
+        """
 
         self._check_double_alt_in_same_pos_in_one_sample()
 
@@ -298,38 +446,34 @@ class Codon:
 
 
 
-def intersect_not_nones(st_lst):
-    """
-    intersection of sample sets in a list of len 3 of which one can be None
-    i.e. [set(1,2,3), set(2,3,4), None] -> set(2,3)
-    """
-    if st0 := st_lst[0]:
-        intrsct = st0
-    else:
-        intrsct = st_lst[1]
-
-    # ignore NONE sets, just the intersection of samples on those positions that show variance
-    for st in st_lst[1:]:
-        if st:
-            intrsct = intrsct.intersection(st)
-
-    return intrsct
-
-
 
 def gt_intersection(gts_per_position):
+    """
+    Determines the intersection of ground-truth arrays for a given set of positions.
+
+    This function processes a list of arrays, removing any `None` values, and evaluates
+    whether all valid arrays have a value of 1 at each corresponding position.
+
+    ie.:
+    [[0, 1, 1, 0, 1]   | gts for pos 1
+     [1, 1, 0, 1, 1]   | gts for pos 2
+     [0, 1, 1, 1, 1]]  | gts for pos 3
+    -------------------
+     [0, 1, 0, 0, 1] <- Intersection (returned array)
+
+    (False interpreted as 0, True interpreted as 1)
+
+    Arguments:
+    gts_per_position : list
+        A list where each element is either a numpy array or None. Each non-None
+        array is expected to have the same shape.
+
+    Returns:
+    np array
+        A boolean array indicating positions where all valid arrays have a value of 1.
+    """
     valid = np.array([arr for arr in gts_per_position if arr is not None])
     return np.all(valid == 1, axis=0)
-
-
-
-def generate_per_sample_stats_string(sample_stats_per_position):
-    valid = np.array([arr for arr in sample_stats_per_position if arr is not None])
-    # interpreting missing values as minimum!
-    min_stats = np.min(valid, axis=0)
-
-    stats_concat = [":".join(str(x) for x in stats) for stats in min_stats]
-    return "\t".join(stats_concat).replace(".", ",").replace("nan", ".")
 
 
 
@@ -340,6 +484,9 @@ def mnv_vcf_entry_string(codon,
                          sample_stats_per_position,
                          num_alt_in_codon,
                          intersection_per_position):
+    """
+    Generates a cMNV VCF entry string for a codon with multiple nucleotide variants.
+    """
 
     if codon.affected_positions[2] is None:
         start = 0
@@ -368,6 +515,27 @@ def prepare_mnv_vcf_entry_string(codon,
                                  current_codon_seq,
                                  gts_per_position,
                                  sample_stats_per_position):
+    """
+    Prepares a partially applied cMNV VCF entry string generator.
+    
+    This helper stores the codon-specific arguments that stay constant for one
+    codon variant combination and returns a nested function that only requires
+    the number of altered positions and the sample intersection information.
+    
+    Arguments:
+        codon (Codon): Codon object containing reference sequence, position,
+            chromosome and FORMAT information.
+        current_codon_seq (list[str]): Current codon sequence after applying
+            the selected alternate bases.
+        gts_per_position (list[np.ndarray | None]): Per-position genotype arrays
+            indicating which samples carry the respective variant.
+        sample_stats_per_position (list[SampleStats | None]): Per-position sample
+            genotype field statistics for the respective variant.
+    
+    Returns:
+        Callable: Function that takes num_alt_in_codon and intersection_per_position
+            and returns the final cMNV VCF entry string.
+    """
 
     def rest(num_alt_in_codon, intersection_per_position):
         return mnv_vcf_entry_string(codon,
@@ -382,6 +550,28 @@ def prepare_mnv_vcf_entry_string(codon,
 
 
 def report_codon_variants(codon: Codon):
+    """
+    Reports all cMNV entries detected within a given codon.
+
+    The function iterates over all possible alternate base combinations of the codon
+    and checks whether at least two altered positions are shared by the same samples.
+
+    For codons with two altered positions, one cMNV entry is reported if the two
+    genotype arrays have a non-empty intersection.
+
+    For codons with three altered positions, the function first checks for samples
+    carrying all three variants. It then checks all pairwise combinations while
+    excluding samples already counted in the three-position overlap.
+
+    Arguments:
+        codon (Codon): Codon object containing the observed variants, genotype arrays
+            and genotype field statistics.
+
+    Returns:
+        str: String containing one or more cMNV VCF entry lines, each ending with a
+            newline. Returns an empty string if no cMNV is detected.
+    """
+
     mnv_entries = []
 
     # since it is possible to have multiple alt entries for one position,
@@ -434,6 +624,7 @@ def report_codon_variants(codon: Codon):
 
 
 def parse_args():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Find and add Codon based Multiple Nucleotide Variants to a VCF file")
     parser.add_argument("vcf_file", type=Path, help="VCF file for a single gene to process")
     parser.add_argument("reference_sequence", type=Path, help="Reference FASTA file")
@@ -444,6 +635,17 @@ def parse_args():
 
 
 def main():
+    """
+    Runs the codonMNV command-line workflow.
+
+    The function reads the input VCF and reference FASTA, extracts the CDS region,
+    scans variants codon by codon and writes the original VCF entries together
+    with newly detected cMNV entries to the output VCF file.
+
+    The main() function also includes one of the two algorithms for finding cMNVs:
+    it groups consecutive VCF entries by codon, filters unsupported variant types
+    and reports a codon only after all variants belonging to that codon have been collected.
+    """
 
     args = parse_args()
     genomic_start, genomic_end = start_end_of_gene(args.vcf_file)
@@ -451,7 +653,7 @@ def main():
 
     # header strings
     CALL_STRING = f"##codonMNVCommand={" ".join(sys.argv)}\n"
-    INFO_STRING = ('##INFO=<ID=icMNV,Number=1,Type=String,Description="'
+    INFO_STRING = ('##INFO=<ID=cMNV,Number=1,Type=String,Description="'
                          'Computed Multiple Nucleotide Variant within one Codon. '
                          'Format: Num_alt_in_codon | Codon_idx_in_CDS | Original_codon '
                          '| Variant_codon | affected_positions | samples_with_alt_per_position '
